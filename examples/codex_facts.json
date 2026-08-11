@@ -1,0 +1,9 @@
+{
+  "dataset": "tiny-controller-fixture",
+  "observations": [
+    {"method": "A", "score": 0.71},
+    {"method": "B", "score": 0.68}
+  ],
+  "required_threshold": 0.70,
+  "allowed_conclusion": "Method A meets the supplied threshold; Method B does not."
+}

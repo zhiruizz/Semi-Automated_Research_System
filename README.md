@@ -1,8 +1,10 @@
 # Semi-Automated Research System
 
-This repository contains Phase 1 of the Research Controller: a deterministic,
-auditable, crash-recoverable control plane for local research computation.
-Agents and school compute are deliberately not connected yet.
+This repository contains Phases 1–5 of the Research Controller: a deterministic,
+auditable, crash-recoverable control plane for local research computation and
+typed Agent execution. Production implementation/debug tasks can use the local
+Hermes Runs API; scientific/review roles can use Codex App Server with native
+structured output. MockAgent remains explicit. School compute is not connected.
 
 ## What works
 
@@ -11,15 +13,34 @@ Agents and school compute are deliberately not connected yet.
 - Relational task dependencies and task/artifact links.
 - Audited Task and ComputeJob transitions. State mutation and Event append share
   one database transaction, and ORM guards reject direct status mutation.
+- Audited AgentRun transitions with the same transaction and direct-mutation
+  protection.
 - Strict Pydantic v2 compute protocols with unknown fields rejected.
+- Strict versioned AgentTaskSpec, AgentResult, decision, transition request,
+  context, route, and external observation protocols.
+- An Agent Gateway with role routing, Artifact-only context packs,
+  NEW/RESUME_ROLE/EPHEMERAL sessions, and role-isolated resume lookup.
+- A detached filesystem-backed MockAgent whose durable identity and idempotency
+  key are the persisted AgentRun.id.
+- A typed, capability-driven Hermes Runs API client and production adapter with
+  real run/session identity, usage accounting, approvals, stop polling, strict
+  AgentResult envelopes, and raw plus normalized response Artifacts.
+- A detached persistent Hermes StartBridge that survives Controller-process
+  termination and prevents a duplicate Runs POST during Controller recovery.
+- A Codex App Server adapter with persistent Thread/Turn identity, native output
+  schemas, isolated workspaces, generic approvals, turn-local usage, and a
+  detached recovery bridge.
 - Local CPU execution through an idempotent ComputeProvider.
-- Optional deterministic GPU inventory using `nvidia-smi` (GPU leasing belongs
-  to Phase 2 and is not claimed here).
+- Deterministic, testable NVIDIA inventory and external-process discovery using
+  `nvidia-smi`, without importing PyTorch.
+- Durable exclusive single-GPU allocation backed by active ComputeJob rows.
+- Two-GPU concurrency, normal third-task queueing, external-busy avoidance, and
+  restart-safe GPU reservations.
 - `research-runner`, which creates `manifest.json`, `run.out`, `run.error`, and
   atomically written `exit.json`.
 - Content-addressed immutable local Artifact storage.
 - Ordered Controller ticks and recovery at every local submission boundary.
-- A runnable count demo and automated vertical-slice/crash tests.
+- Runnable compute and Agent demos plus automated vertical-slice/crash tests.
 
 ## Setup
 
@@ -50,6 +71,58 @@ the persisted state with:
 .venv/bin/research-controller status
 ```
 
+Run the typed Agent vertical slice without any real model/API call:
+
+```bash
+.venv/bin/research-controller agent-demo --run
+```
+
+The MockAgent runs in a detached process, writes one declared summary, returns a
+strict AgentResult, and succeeds the Task only after Controller verification.
+
+Inspect the configured real Hermes endpoint without making a model call:
+
+```bash
+export SARS_HERMES_API_KEY='your-local-gateway-key'
+.venv/bin/research-controller hermes status
+.venv/bin/research-controller hermes models
+```
+
+The key is loaded only from the named environment variable. It is never written
+to YAML, bridge records, the database, Events, or Artifacts. A tiny real task is
+explicit opt-in:
+
+```bash
+.venv/bin/research-controller hermes-demo --real --run
+```
+
+Approval is never automatic. Inspect and resolve a pending request with:
+
+```bash
+.venv/bin/research-controller agent approvals
+.venv/bin/research-controller agent approve <AgentRun.id>
+.venv/bin/research-controller agent deny <AgentRun.id>
+```
+
+Only `once` and `deny` are exposed. See [docs/HERMES_BACKEND.md](docs/HERMES_BACKEND.md)
+for configuration, recovery, session, and test details.
+
+Inspect Codex without starting a model turn:
+
+```bash
+.venv/bin/research-controller codex status
+.venv/bin/research-controller codex models
+```
+
+Run the tiny facts demo only when one real turn is intended:
+
+```bash
+.venv/bin/research-controller codex-demo --real --run
+```
+
+The adapter uses existing local Codex auth and never performs login/logout,
+upgrades, or global config changes. See [docs/CODEX_BACKEND.md](docs/CODEX_BACKEND.md).
+
 Run one tick, run until all current work is terminal, or operate continuously:
 
 ```bash
@@ -74,7 +147,7 @@ Global paths may be overridden before the subcommand:
 | `projects` | Macro research lifecycle, phase/stage, active artifact pointers, policy and budget placeholders |
 | `tasks` | Intent, dependencies, acceptance/retry policy, attempts, lease, and verified result |
 | `events` | Append-only per-Project audit records with unique monotonic `seq` |
-| `agent_runs` | Reserved Phase 1 schema for future typed Agent attempts; no adapter is active |
+| `agent_runs` | Typed Agent attempts, backend/session identity, durable external id, request/response Artifact links, result, timing, and failure details |
 | `compute_jobs` | Local/remote-neutral execution attempts and independent observation state |
 | `artifacts` | Immutable, hashed, versioned persisted outputs and evidence eligibility |
 | `task_dependencies` | Explicit Task-to-Task prerequisites |
@@ -113,20 +186,109 @@ record atomically. A restarted Controller can therefore recover when interrupted
 Collection is safe to repeat: CAS writes and Artifact rows are deduplicated by
 producer, logical name, and hash.
 
+Agent execution uses the same recovery rule. The Controller first persists an
+AgentRun in `STARTING`; only then may the adapter receive
+`run_key=AgentRun.id`. Every STARTING recovery calls `reconcile(run_key)` before
+`start()`. Mock state is stored under:
+
+```text
+workspace/.mock-agent/runs/<AgentRun.id>/
+```
+
+An atomic `launch.claim` lets only one detached runner execute, even across the
+uncertain interval between process launch and saving `external_run_id`. Request,
+raw response, start, exit, output, and launch-count records survive Controller
+termination. A valid backend call makes AgentRun `SUCCEEDED`; Task success is a
+separate decision:
+
+```text
+AgentRun SUCCEEDED -> Task VERIFYING -> Task SUCCEEDED / FAILED
+```
+
+A semantic `blocked`/`failed` result still means the AgentRun succeeded, while
+process crashes, timeouts, and invalid typed responses fail the AgentRun.
+Transition requests and requested tasks are validated and recorded only; they
+never mutate Project stage or create Tasks automatically.
+
+Produced paths must resolve inside the AgentRun work directory before immutable
+Artifact ingestion. Required context must reference an existing verified
+Artifact; missing required context blocks the Task before external launch.
+
+Production Hermes work is isolated under:
+
+```text
+workspace/<Project.id>/agent-runs/<AgentRun.id>/
+```
+
+The adapter calls only the asynchronous Runs API and polls it as the source of
+truth; it never silently falls back to chat completions. Hermes v0.19.0 does not
+offer durable Runs idempotency. A local detached bridge owns one POST per
+AgentRun and is safe across Controller-process SIGKILL. A host crash after the
+remote accepted the POST but before the bridge saved its run id remains an
+unavoidable uncertainty: the run becomes `START_STATE_UNCERTAIN`, the Task is
+blocked, and no automatic retry occurs. Host-level exactly-once is not claimed.
+
+Codex work uses the same per-AgentRun directory. Context Artifacts are copied to
+disposable read-only `inputs/`, never hardlinked from the CAS. The bridge maps
+`session_id` to `thread.id` and `external_run_id` to `turn.id`, and reconciles a
+lost turn response through history plus a stable AgentRun marker. An unknown
+new-thread gap becomes `CODEX_START_STATE_UNCERTAIN` and is never retried.
+
+## Local GPU allocation
+
+Phase 2 supports `gpu_count=0` and `gpu_count=1`. A local job requesting more
+than one GPU is structurally unsupported and is blocked with
+`RESOURCE_UNAVAILABLE`; it is never silently assigned one GPU.
+
+GPU allocation has two layers:
+
+```text
+nvidia-smi physical inventory and external-busy signals
+  + active local ComputeJob rows (CREATED/SUBMITTED/PENDING/RUNNING)
+  = effective ResourceSnapshot used by ComputeRouter
+```
+
+An active job's `resource_class` (`local_gpu_0`, `local_gpu_1`, ...) is the
+durable exclusive reservation. The selected index, UUID, model, and allocation
+type are stored in `provider_metadata_json`. No in-memory lease set or seventh
+core entity is used. `COLLECTING` and terminal jobs no longer reserve the GPU
+because reconciliation has confirmed the workload stopped using it.
+
+Physical capability and current availability remain separate. An operational
+20 GB GPU can be temporarily unschedulable because it is Controller-reserved or
+externally busy. A physically capable but busy Task remains READY with a short
+`not_before` backoff; a Task exceeding local memory capacity becomes BLOCKED.
+Normal waiting does not emit repeated Events.
+
+External processes are never killed or represented as fake ComputeJobs. The
+default exclusive policy avoids a GPU when `nvidia-smi` reports a compute
+process, at least 1,024 MB used memory, or at least 20% utilization. Policy
+defaults are documented in `config/providers/local.yaml` and injectable for
+tests/deployment configuration.
+
+Once routing chooses `local_gpu_N`, `prepare()` does not rediscover or reselect
+hardware. It deterministically sets:
+
+```text
+CUDA_VISIBLE_DEVICES=N
+```
+
+CPU Tasks continue through `local_cpu` regardless of GPU reservations.
+
 ## Controller tick order
 
 Every tick preserves this order:
 
-1. Reconcile already-known ComputeJobs.
+1. Reconcile already-known ComputeJobs and AgentRuns, regardless of Project pause.
 2. Recover expired leases.
-3. Reconcile CREATED/uncertain submissions.
+3. Reconcile CREATED compute submissions and STARTING AgentRuns.
 4. Reconcile dependencies into READY.
-5. Verify completed work.
+5. Verify completed compute and Agent work.
 6. Evaluate deterministic project gates (Phase 1 hook only).
-7. Dispatch new active-project Compute Tasks.
+7. Dispatch new active-project Compute Tasks, then Agent Tasks.
 
-External I/O is not awaited inside a long database transaction. Providers
-receive immutable `ComputeJobView` values, never ORM objects.
+External I/O is not awaited inside a long database transaction. Providers and
+Agent adapters receive immutable views, never ORM objects.
 
 ## Tests
 
@@ -138,7 +300,37 @@ The suite covers transition legality and transaction rollback, direct mutation
 guards, dependencies, idempotency, lease recovery, strict schemas, Artifact
 hashing/immutability, successful and failed local jobs, uncertain submission
 reconciliation, all persisted recovery boundaries, and an actual Controller
-subprocess `SIGKILL` followed by restart.
+subprocess `SIGKILL` followed by restart. Phase 2 adds pure `nvidia-smi` parsing,
+external-busy policy, typed route failure, memory limits, unsupported multi-GPU,
+two-GPU concurrency, third-task queueing, CPU independence, exact
+`CUDA_VISIBLE_DEVICES`, CREATED/uncertain-submit reservations, cancellation
+safety, and a real Controller `SIGKILL` while two fake-GPU jobs remain active.
+Phase 3 adds strict Agent/decision protocols, permissions, path sandboxing,
+context validation, session resume and role isolation, semantic-vs-backend
+failure, request/response Artifacts, STARTING/uncertain/RUNNING/result recovery,
+active AgentRun lease protection, exactly-once launch, and a real Controller
+SIGKILL while the detached MockAgent survives.
+
+Phase 4 adds a zero-real-call FakeHermes server suite covering authentication,
+capabilities, submission/poll/stop, approval, unknown and missing remote runs,
+strict dual results, session/tier isolation, timeouts, uncertain HTTP starts,
+and a real Controller SIGKILL with exactly one fake Runs POST. Real Hermes tests
+are excluded unless `SARS_HERMES_INTEGRATION=1` is explicitly set.
+
+Phase 5 adds a durable Fake Codex App Server suite for auth/model discovery,
+native schemas, sandbox/context integrity, sessions, role/tier isolation,
+approvals, usage, interrupts, invalid results, uncertain starts, collection, and
+Controller SIGKILL recovery with one `turn/start`. Real Codex is excluded unless
+`SARS_CODEX_INTEGRATION=1` is explicitly set.
+
+Phase 5.1 replaces direct domain-schema submission with a versioned Codex wire
+contract. Its static compatibility report and exact projected schemas require no
+model call:
+
+```bash
+.venv/bin/research-controller codex schema agent-result
+.venv/bin/research-controller codex schema decision-result --json
+```
 
 ## Repository layout
 
@@ -147,10 +339,11 @@ config/                     Controller and local provider configuration
 examples/count.py           Phase 1 deterministic demo workload
 src/research_controller/
   artifacts/                Immutable content-addressed store
-  compute/                  Provider interface/router and LocalProvider
+  agents/                   Gateway, MockAgent, Hermes Runs, and Codex adapters/bridges
+  compute/                  Provider interface/router, LocalProvider, NVIDIA parser
   db/                       SQLAlchemy models, engine, session guards
   domain/                   Enums and opaque ids
-  protocols/                Strict Pydantic compute protocols
+  protocols/                Strict Pydantic compute and Agent protocols
   runner/                   Durable process wrapper
   services/                 Event, transition, readiness, dispatch, reconcile, validation
   cli.py                    CLI entrypoint
@@ -160,10 +353,32 @@ tests/                      Unit, integration, and crash-recovery tests
 
 ## Explicitly deferred
 
-- Local GPU allocation/lease and two-GPU concurrency (Phase 2).
-- Agent protocols, Agent Gateway, and MockAgent (Phase 3).
-- Hermes and Codex adapters and escalation (Phases 4–6).
+- Automatic escalation (Phase 6). Codex escalation flags are recorded only; no
+  escalation engine or automatic Task creation exists.
 - MUST VPN, Paramiko, Slurm, dynamic school resources, and B20X (Phases 7–8).
 - Scientific workflow, Experiment Contract, paper flow, Web UI, and migrations.
 
-No credentials, remote submission code, or real GPU workload are included.
+No credentials, school submission code, or real GPU workload are included.
+
+## Current Agent limits
+
+- Hermes is optional and requires an explicitly supplied bearer environment
+  variable. Model tier mappings default to the current gateway default; no real
+  provider or model is hard-coded.
+- Hermes retains conservative new-session FORK behavior; Codex FORK_ROLE is
+  explicitly rejected as deferred until a Controller fork policy is defined.
+- Context FULL/METADATA/OMIT are implemented; SUMMARY and EXCERPT remain metadata
+  placeholders without LLM summarization.
+- Requested Tasks, transition requests, protocol amendments, and escalation
+  flags are recorded but never executed automatically.
+- Agent retry/escalation policy and scientific stage gates remain deferred.
+
+## Current local GPU limits
+
+- Single Controller only; multi-controller allocation is not guaranteed.
+- Each local job supports zero or one GPU; no local multi-GPU training.
+- Exclusive whole-GPU reservations only; no MIG, MPS, fractional sharing, or
+  memory packing.
+- External-busy detection is conservative and snapshot-based.
+- No preemption: cancel sends SIGTERM, and the reservation remains until poll
+  confirms the process is terminal.

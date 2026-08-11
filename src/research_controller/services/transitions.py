@@ -6,8 +6,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from research_controller.db.base import utc_now
-from research_controller.db.models import ComputeJob, Task
+from research_controller.db.models import AgentRun, ComputeJob, Task
 from research_controller.domain.enums import (
+    AgentRunStatus,
     ComputeExecutionStatus,
     ObservationStatus,
     TaskStatus,
@@ -98,6 +99,43 @@ COMPUTE_TRANSITIONS: dict[ComputeExecutionStatus, frozenset[ComputeExecutionStat
 }
 
 
+AGENT_RUN_TRANSITIONS: dict[AgentRunStatus, frozenset[AgentRunStatus]] = {
+    AgentRunStatus.QUEUED: frozenset(
+        {AgentRunStatus.STARTING, AgentRunStatus.CANCELLED}
+    ),
+    AgentRunStatus.STARTING: frozenset(
+        {
+            AgentRunStatus.RUNNING,
+            AgentRunStatus.FAILED,
+            AgentRunStatus.TIMEOUT,
+            AgentRunStatus.CANCELLED,
+        }
+    ),
+    AgentRunStatus.RUNNING: frozenset(
+        {
+            AgentRunStatus.WAITING_APPROVAL,
+            AgentRunStatus.SUCCEEDED,
+            AgentRunStatus.FAILED,
+            AgentRunStatus.TIMEOUT,
+            AgentRunStatus.CANCELLED,
+        }
+    ),
+    AgentRunStatus.WAITING_APPROVAL: frozenset(
+        {
+            AgentRunStatus.RUNNING,
+            AgentRunStatus.SUCCEEDED,
+            AgentRunStatus.FAILED,
+            AgentRunStatus.TIMEOUT,
+            AgentRunStatus.CANCELLED,
+        }
+    ),
+    AgentRunStatus.SUCCEEDED: frozenset(),
+    AgentRunStatus.FAILED: frozenset(),
+    AgentRunStatus.TIMEOUT: frozenset(),
+    AgentRunStatus.CANCELLED: frozenset(),
+}
+
+
 TASK_EVENT_TYPES = {
     TaskStatus.READY: "TASK_READY",
     TaskStatus.RUNNING: "TASK_STARTED",
@@ -120,6 +158,17 @@ COMPUTE_EVENT_TYPES = {
     ComputeExecutionStatus.OOM: "COMPUTE_JOB_OOM",
     ComputeExecutionStatus.TIMEOUT: "COMPUTE_JOB_TIMEOUT",
     ComputeExecutionStatus.CANCELLED: "COMPUTE_JOB_CANCELLED",
+}
+
+
+AGENT_RUN_EVENT_TYPES = {
+    AgentRunStatus.STARTING: "AGENT_RUN_STARTING",
+    AgentRunStatus.RUNNING: "AGENT_RUN_STARTED",
+    AgentRunStatus.WAITING_APPROVAL: "AGENT_RUN_WAITING_APPROVAL",
+    AgentRunStatus.SUCCEEDED: "AGENT_RUN_SUCCEEDED",
+    AgentRunStatus.FAILED: "AGENT_RUN_FAILED",
+    AgentRunStatus.TIMEOUT: "AGENT_RUN_TIMEOUT",
+    AgentRunStatus.CANCELLED: "AGENT_RUN_CANCELLED",
 }
 
 
@@ -157,6 +206,7 @@ class TransitionService:
         if to_status in {
             TaskStatus.SUCCEEDED,
             TaskStatus.FAILED,
+            TaskStatus.BLOCKED,
             TaskStatus.CANCELLED,
             TaskStatus.SKIPPED,
         }:
@@ -218,6 +268,54 @@ class TransitionService:
             event_type=COMPUTE_EVENT_TYPES[to_status],
             entity_type="COMPUTE_JOB",
             entity_id=job.id,
+            correlation_id=correlation_id,
+            old_state=old_status.value,
+            new_state=to_status.value,
+            payload=payload,
+        )
+
+    def transition_agent_run(
+        self,
+        session: Session,
+        run: AgentRun,
+        to_status: AgentRunStatus,
+        *,
+        expected_status: AgentRunStatus | None = None,
+        event_type: str | None = None,
+        correlation_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        old_status = run.status
+        if expected_status is not None and old_status is not expected_status:
+            raise InvalidTransition(
+                f"expected AgentRun {run.id} in {expected_status}, found {old_status}"
+            )
+        if to_status is old_status:
+            return
+        if to_status not in AGENT_RUN_TRANSITIONS[old_status]:
+            raise InvalidTransition(
+                f"illegal AgentRun transition: {old_status} -> {to_status}"
+            )
+
+        changed_at = now or utc_now()
+        run.status = to_status
+        if to_status is AgentRunStatus.RUNNING:
+            run.started_at = run.started_at or changed_at
+            run.heartbeat_at = changed_at
+        if to_status in {
+            AgentRunStatus.SUCCEEDED,
+            AgentRunStatus.FAILED,
+            AgentRunStatus.TIMEOUT,
+            AgentRunStatus.CANCELLED,
+        }:
+            run.finished_at = changed_at
+        self.events.append(
+            session,
+            project_id=run.project_id,
+            event_type=event_type or AGENT_RUN_EVENT_TYPES[to_status],
+            entity_type="AGENT_RUN",
+            entity_id=run.id,
             correlation_id=correlation_id,
             old_state=old_status.value,
             new_state=to_status.value,

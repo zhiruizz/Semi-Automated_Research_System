@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from research_controller.db.base import Base
 from research_controller.db import models as _models  # noqa: F401  # register mappings
-from research_controller.db.models import ComputeJob, Event, Task
+from research_controller.db.models import AgentRun, ComputeJob, Event, Task
 
 
 def create_sqlite_engine(database_path: Path | str, *, echo: bool = False) -> Engine:
@@ -43,6 +43,7 @@ def enforce_audited_state_changes(
     for entity, entity_type, attribute in (
         *((item, "TASK", "status") for item in session.dirty if isinstance(item, Task)),
         *((item, "COMPUTE_JOB", "execution_status") for item in session.dirty if isinstance(item, ComputeJob)),
+        *((item, "AGENT_RUN", "status") for item in session.dirty if isinstance(item, AgentRun)),
     ):
         history = inspect(entity).attrs[attribute].history
         if not history.has_changes():

@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.orm import Session
 
-from research_controller.db.models import ComputeJob, Task, TaskDependency
-from research_controller.domain.enums import ComputeExecutionStatus, TaskStatus
+from research_controller.db.models import AgentRun, ComputeJob, Task, TaskDependency
+from research_controller.domain.enums import AgentRunStatus, ComputeExecutionStatus, TaskStatus
 from research_controller.services.transitions import TransitionService
 
 
@@ -16,6 +16,13 @@ NONTERMINAL_COMPUTE = {
     ComputeExecutionStatus.PENDING,
     ComputeExecutionStatus.RUNNING,
     ComputeExecutionStatus.COLLECTING,
+}
+
+NONTERMINAL_AGENT = {
+    AgentRunStatus.QUEUED,
+    AgentRunStatus.STARTING,
+    AgentRunStatus.RUNNING,
+    AgentRunStatus.WAITING_APPROVAL,
 }
 
 
@@ -61,7 +68,7 @@ class TaskReadinessService:
         ).all()
         recovered: list[str] = []
         for task in tasks:
-            has_external_work = session.scalar(
+            has_compute_work = session.scalar(
                 select(
                     exists().where(
                         ComputeJob.task_id == task.id,
@@ -69,9 +76,17 @@ class TaskReadinessService:
                     )
                 )
             )
+            has_agent_work = session.scalar(
+                select(
+                    exists().where(
+                        AgentRun.task_id == task.id,
+                        AgentRun.status.in_(NONTERMINAL_AGENT),
+                    )
+                )
+            )
             task.lease_owner = None
             task.lease_expires_at = None
-            if task.status is TaskStatus.RUNNING and not has_external_work:
+            if task.status is TaskStatus.RUNNING and not (has_compute_work or has_agent_work):
                 self.transitions.transition_task(
                     session,
                     task,
