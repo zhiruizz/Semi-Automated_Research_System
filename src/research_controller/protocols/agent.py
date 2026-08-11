@@ -203,7 +203,7 @@ class AgentExecutionRequest(StrictModel):
     task_spec: AgentTaskSpec
     context_pack: ContextPack
     route: RouteDecision
-    session_id: str
+    session_id: str | None = None
     workdir: Path
     adapter_config: dict[str, Any] = Field(default_factory=dict)
 
@@ -212,7 +212,7 @@ class ExternalAgentRun(StrictModel):
     schema_version: Literal["external-agent-run/v0.1"] = "external-agent-run/v0.1"
     run_key: str
     external_run_id: str
-    session_id: str
+    session_id: str | None = None
     status: AgentRunStatus
     workdir: Path
     launched_at: datetime | None = None
@@ -239,6 +239,7 @@ class AgentObservation(StrictModel):
     observed_at: datetime
     status: AgentRunStatus
     raw_state: str
+    session_id: str | None = None
     result_available: bool = False
     error_type: str | None = None
     error_message: str | None = None

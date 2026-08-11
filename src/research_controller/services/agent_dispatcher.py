@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,18 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from research_controller.agents.context import ContextMissingError
 from research_controller.agents.gateway import AgentGateway
+from research_controller.agents.router import BackendNotImplementedError
+from research_controller.agents.hermes.prompt_builder import SYSTEM_INSTRUCTIONS
+from research_controller.agents.codex.prompt_builder import (
+    SYSTEM_INSTRUCTIONS as CODEX_SYSTEM_INSTRUCTIONS,
+    build_context_manifest as build_codex_context_manifest,
+    build_prompt as build_codex_prompt,
+)
+from research_controller.agents.codex.schema import (
+    CodexSchemaCompatibilityError,
+    CodexStructuredOutputAdapter,
+    StructuredContract,
+)
 from research_controller.artifacts.store import ArtifactStore
 from research_controller.db.models import Project, Task
 from research_controller.domain.enums import (
@@ -73,12 +86,17 @@ class AgentDispatcher:
             ).all()
         created: list[str] = []
         for task_id in task_ids:
+            codex_contract: StructuredContract | None = None
             try:
                 with self.session_factory() as session:
                     task = session.get(Task, task_id)
                     if task is None or task.status is not TaskStatus.READY:
                         continue
                     plan = self.gateway.prepare(session, task)
+                    if plan.route.adapter_id == "codex":
+                        codex_contract = (
+                            CodexStructuredOutputAdapter().for_agent_result()
+                        )
             except (ValidationError, ValueError, ContextMissingError) as exc:
                 with self.session_factory.begin() as session:
                     task = session.get(Task, task_id)
@@ -87,6 +105,10 @@ class AgentDispatcher:
                     task.block_reason = (
                         "CONTEXT_MISSING"
                         if isinstance(exc, ContextMissingError)
+                        else "BACKEND_NOT_IMPLEMENTED"
+                        if isinstance(exc, BackendNotImplementedError)
+                        else "CODEX_OUTPUT_SCHEMA_INVALID"
+                        if isinstance(exc, CodexSchemaCompatibilityError)
                         else "INVALID_AGENT_SPEC"
                     )
                     task.error_summary = str(exc)
@@ -119,13 +141,44 @@ class AgentDispatcher:
                         "session_id": plan.session_id,
                         "logical_executor": task.executor.value.lower(),
                         "model_tier": plan.route.model_tier,
-                        "mock": plan.adapter_config,
+                        "adapter_config": plan.adapter_config,
+                        "mock": plan.adapter_config if plan.route.adapter_id == "mock" else {},
                         "workdir": str(
                             self.workspace_root / ".mock-agent" / "runs" / run_id
+                            if plan.route.adapter_id == "mock"
+                            else self.workspace_root
+                            / task.project_id
+                            / "agent-runs"
+                            / run_id
                         ),
                     },
                     correlation_id=correlation_id,
                 )
+                request_metadata: dict[str, Any] = {}
+                if plan.route.adapter_id == "codex":
+                    assert codex_contract is not None
+                    codex_request = self.gateway.request_for_run(
+                        run, Path(run.config_json["workdir"])
+                    )
+                    codex_prompt = build_codex_prompt(
+                        codex_request, build_codex_context_manifest(codex_request)
+                    )
+                    request_metadata = {
+                        "prompt_sha256": hashlib.sha256(codex_prompt.encode()).hexdigest(),
+                        "domain_schema_hash": codex_contract.domain_schema_hash,
+                        "wire_schema_hash": codex_contract.wire_schema_hash,
+                        "codex_schema_hash": codex_contract.codex_schema_hash,
+                        "schema_sha256": codex_contract.codex_schema_hash,
+                        "schema_adapter_version": codex_contract.schema_adapter_version,
+                        "instructions_sha256": hashlib.sha256(
+                            CODEX_SYSTEM_INSTRUCTIONS.encode()
+                        ).hexdigest(),
+                        "sandbox": {
+                            "mode": "workspace-write" if plan.spec.permissions.filesystem_write else "read-only",
+                            "network_access": plan.spec.permissions.network,
+                            "context_enforcement": "verified-disposable-copy",
+                        },
+                    }
                 request_path = self.workspace_root / ".agent-controller" / "requests" / f"{run.id}.json"
                 _atomic_json(
                     request_path,
@@ -135,6 +188,7 @@ class AgentDispatcher:
                         "context_pack": plan.context_pack.model_dump(mode="json"),
                         "route_decision": plan.route.model_dump(mode="json"),
                         "session_id": plan.session_id,
+                        "adapter_contract": request_metadata,
                     },
                 )
                 artifact = self.artifact_store.ingest_file(
@@ -147,6 +201,17 @@ class AgentDispatcher:
                     producer_type="AGENT_RUN",
                     producer_ref_id=run.id,
                     schema_name="agent-request-record/v0.1",
+                    metadata={
+                        "backend": plan.route.adapter_id,
+                        "role": plan.spec.role,
+                        "model_tier": plan.route.model_tier,
+                        "instructions_sha256": hashlib.sha256(
+                            SYSTEM_INSTRUCTIONS.encode("utf-8")
+                        ).hexdigest()
+                        if plan.route.adapter_id == "hermes"
+                        else request_metadata.get("instructions_sha256"),
+                        **request_metadata,
+                    },
                     correlation_id=correlation_id,
                 )
                 run.request_artifact_id = artifact.id

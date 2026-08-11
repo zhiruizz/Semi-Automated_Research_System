@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from research_controller.artifacts.store import ArtifactStore
 from research_controller.agents.gateway import AgentGateway
 from research_controller.agents.mock_adapter import MockAgentAdapter
+from research_controller.agents.hermes.adapter import HermesAdapter
+from research_controller.agents.codex.adapter import CodexAdapter
 from research_controller.agents.registry import AgentAdapterRegistry
 from research_controller.compute.local.provider import LocalProvider
 from research_controller.compute.registry import ProviderRegistry
@@ -62,7 +64,11 @@ class ResearchController:
         )
         self.artifacts = ArtifactStore(self.workspace_root)
         self.agent_registry = agent_registry or AgentAdapterRegistry(
-            [MockAgentAdapter(self.workspace_root / ".mock-agent")]
+            [
+                HermesAdapter(self.workspace_root),
+                CodexAdapter(self.workspace_root),
+                MockAgentAdapter(self.workspace_root / ".mock-agent"),
+            ]
         )
         self.agent_gateway = AgentGateway(self.agent_registry)
         self.transitions = TransitionService()

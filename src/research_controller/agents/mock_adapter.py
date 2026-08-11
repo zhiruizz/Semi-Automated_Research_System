@@ -148,7 +148,11 @@ class MockAgentAdapter(AgentAdapter):
         response = run_dir / "raw_response.json"
         exit_path = run_dir / "exit.json"
         process_path = run_dir / "process.json"
-        if response.exists():
+        cancelled_path = run_dir / "cancelled.json"
+        if cancelled_path.exists():
+            status = AgentRunStatus.CANCELLED
+            raw_state = "CANCELLED"
+        elif response.exists():
             status = AgentRunStatus.SUCCEEDED
             raw_state = "RESULT_WRITTEN"
         elif exit_path.exists():
@@ -179,7 +183,8 @@ class MockAgentAdapter(AgentAdapter):
         return AgentResult.model_validate(_load(self.run_dir(run.id) / "raw_response.json"))
 
     async def cancel(self, run: AgentRunView) -> None:
-        process_path = self.run_dir(run.id) / "process.json"
+        run_dir = self.run_dir(run.id)
+        process_path = run_dir / "process.json"
         if not process_path.exists():
             return
         pid = int(_load(process_path).get("pid", 0))
@@ -189,3 +194,4 @@ class MockAgentAdapter(AgentAdapter):
             os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
+        _atomic_json(run_dir / "cancelled.json", {"cancelled_at": _now().isoformat()})

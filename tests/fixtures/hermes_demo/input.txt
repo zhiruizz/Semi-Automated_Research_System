@@ -1,0 +1,1 @@
+Return a short typed AgentResult and one short implementation summary file.

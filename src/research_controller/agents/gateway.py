@@ -24,7 +24,7 @@ class AgentExecutionPlan:
     spec: AgentTaskSpec
     context_pack: ContextPack
     route: RouteDecision
-    session_id: str
+    session_id: str | None
     adapter_config: dict[str, Any]
 
 
@@ -46,7 +46,7 @@ class AgentGateway:
         spec = AgentTaskSpec.model_validate(task.spec_json)
         if spec.project_id != task.project_id or spec.task_id != task.id:
             raise ValueError("AgentTaskSpec identity does not match Task")
-        route = self.router.route(spec, task.executor)
+        route = self.router.route(spec, task.executor, task.routing_policy_json)
         context_pack = self.context_builder.build(session, spec)
         session_id = self.sessions.select(
             session,
@@ -54,13 +54,14 @@ class AgentGateway:
             role=spec.role,
             backend=route.adapter_id,
             policy=route.session_policy,
+            model_tier=route.model_tier,
         )
         return AgentExecutionPlan(
             spec=spec,
             context_pack=context_pack,
             route=route,
             session_id=session_id,
-            adapter_config=dict(task.routing_policy_json.get("mock", {})),
+            adapter_config=dict(task.routing_policy_json.get(route.adapter_id, {})),
         )
 
     def request_for_run(self, run: AgentRun, workdir: Path) -> AgentExecutionRequest:
@@ -70,7 +71,7 @@ class AgentGateway:
             task_spec=AgentTaskSpec.model_validate(config["task_spec"]),
             context_pack=ContextPack.model_validate(config["context_pack"]),
             route=RouteDecision.model_validate(config["route"]),
-            session_id=run.session_id or config["session_id"],
+            session_id=run.session_id or config.get("session_id"),
             workdir=workdir,
-            adapter_config=dict(config.get("mock", {})),
+            adapter_config=dict(config.get("adapter_config", config.get("mock", {}))),
         )

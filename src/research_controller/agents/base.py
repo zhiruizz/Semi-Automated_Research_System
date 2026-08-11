@@ -11,6 +11,15 @@ from research_controller.protocols.agent import (
 )
 
 
+class AgentAdapterError(RuntimeError):
+    """A classified backend failure safe to persist in the Controller DB."""
+
+    def __init__(self, error_type: str, message: str, *, block_task: bool = False) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+        self.block_task = block_task
+
+
 class AgentAdapter(ABC):
     adapter_id: str
 
@@ -28,3 +37,9 @@ class AgentAdapter(ABC):
 
     @abstractmethod
     async def cancel(self, run: AgentRunView) -> None: ...
+
+    async def respond_approval(self, run: AgentRunView, choice: str) -> dict[str, object]:
+        raise AgentAdapterError(
+            "APPROVAL_NOT_SUPPORTED",
+            f"adapter {self.adapter_id} does not support approvals",
+        )

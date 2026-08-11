@@ -9,6 +9,10 @@ from research_controller.domain.enums import TaskExecutor
 from research_controller.protocols.agent import AgentTaskSpec, RouteDecision
 
 
+class BackendNotImplementedError(ValueError):
+    pass
+
+
 DEFAULT_ROLES: dict[str, dict[str, str]] = {
     "implementation_worker": {
         "logical_executor": "hermes",
@@ -23,6 +27,12 @@ DEFAULT_ROLES: dict[str, dict[str, str]] = {
         "context_profile": "debug",
     },
     "scientific_supervisor": {
+        "logical_executor": "codex",
+        "model_tier": "supervisor",
+        "session_policy": "resume_role",
+        "context_profile": "scientific",
+    },
+    "experiment_planner": {
         "logical_executor": "codex",
         "model_tier": "supervisor",
         "session_policy": "resume_role",
@@ -46,6 +56,12 @@ DEFAULT_ROLES: dict[str, dict[str, str]] = {
         "session_policy": "new",
         "context_profile": "paper_review",
     },
+    "integrity_reviewer": {
+        "logical_executor": "codex",
+        "model_tier": "supervisor",
+        "session_policy": "new",
+        "context_profile": "scientific_review",
+    },
 }
 
 
@@ -59,18 +75,50 @@ class AgentRouter:
             if isinstance(loaded.get("roles"), dict):
                 self.roles = {**DEFAULT_ROLES, **loaded["roles"]}
 
-    def route(self, spec: AgentTaskSpec, executor: TaskExecutor) -> RouteDecision:
+    def route(
+        self,
+        spec: AgentTaskSpec,
+        executor: TaskExecutor,
+        routing_policy: dict[str, Any] | None = None,
+    ) -> RouteDecision:
+        policy = routing_policy or {}
         configured: dict[str, Any] = self.roles.get(spec.role, {})
         logical = str(configured.get("logical_executor", executor.value.lower()))
         if logical != executor.value.lower():
             # Task.executor is the persisted source of logical ownership.
             logical = executor.value.lower()
+        explicit_adapter = policy.get("adapter")
+        if explicit_adapter == "mock" or "mock" in policy:
+            adapter_id = "mock"
+            reason = "explicit test/demo mock route"
+        elif executor is TaskExecutor.HERMES and spec.role in {
+            "implementation_worker",
+            "debug_worker",
+        }:
+            adapter_id = "hermes"
+            reason = "production Hermes Runs API route"
+        elif executor is TaskExecutor.CODEX and spec.role in {
+            "scientific_supervisor",
+            "experiment_planner",
+            "result_reviewer",
+            "paper_writer",
+            "paper_reviewer",
+            "integrity_reviewer",
+        }:
+            adapter_id = "codex"
+            reason = "production Codex App Server route"
+        else:
+            raise BackendNotImplementedError(
+                f"no production Agent adapter for executor={executor.value} role={spec.role}"
+            )
+        if adapter_id == "codex" and spec.execution_policy.session_policy.value == "fork_role":
+            raise BackendNotImplementedError("CODEX_FORK_ROLE_DEFERRED")
         return RouteDecision(
-            adapter_id="mock",
+            adapter_id=adapter_id,
             logical_executor=logical,
             role=spec.role,
-            model_tier=str(configured.get("model_tier", "cheap")),
+            model_tier=str(policy.get("model_tier", configured.get("model_tier", "cheap"))),
             session_policy=spec.execution_policy.session_policy,
             context_profile=str(configured.get("context_profile", "default")),
-            reason="phase3 mock route",
+            reason=reason,
         )

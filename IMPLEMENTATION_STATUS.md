@@ -115,6 +115,142 @@ The SIGKILL recovery test waits until the detached MockAgent has started, kills
 the Controller process, restarts it against the same SQLite DB/workspace, and
 asserts Task/AgentRun success plus exactly one line in `launch_count.txt`.
 
+## Phase 4 Definition of Done
+
+- [x] Inspected the live local Hermes 0.19.0 install, doctor output, authenticated
+  capabilities, toolsets, skills, model-options timeout, and Runs source without
+  recording any credential.
+- [x] Added an async typed `HermesApiClient` for health, capabilities, models,
+  start/get/stop/approval, session get, and session fork.
+- [x] Bearer configuration stores only `api_key_env`; response/error text is
+  bounded and the secret value is absent from DB, bridge, Events, and Artifacts.
+- [x] Registered `HermesAdapter`; production implementation/debug HERMES Tasks
+  route to it while Mock is explicit and CODEX remains not implemented.
+- [x] Runs capability is mandatory. There is no synchronous chat fallback.
+- [x] Added stable prompts, context manifests, isolated per-AgentRun workdirs,
+  output sandboxing, strict final envelope parsing, dual-file canonical equality,
+  and no JSON repair.
+- [x] Polling centrally maps running, approval, stopping, completed, failed,
+  cancelled, and unknown statuses. Unknown status remains non-terminal.
+- [x] Approval is never automatic; the CLI exposes only `once` and `deny` and
+  records human actions.
+- [x] Stop is a request, not a terminal observation. Timeout waits for remote
+  cancellation before recording `TIMEOUT`.
+- [x] Real returned session ids and exact reported usage are persisted. Resume
+  is isolated by Project, role, backend, non-ephemeral mode, and model tier.
+- [x] Raw Hermes output and normalized AgentResult are separate immutable
+  Artifacts; invalid raw output is preserved.
+- [x] Source inspection proved Hermes 0.19.0 Runs lacks native idempotency. A
+  detached persistent StartBridge owns one POST per AgentRun.
+- [x] Dropped HTTP response becomes `START_STATE_UNCERTAIN` and is never retried;
+  missing known remote run becomes `REMOTE_RUN_NOT_FOUND` and blocks.
+- [x] Fake server tests cover auth/capabilities/models, submission/poll/stop,
+  approval once/deny, timeout, result errors, sessions/tier, unknown/missing run,
+  HTTP uncertainty, and Controller SIGKILL with one POST.
+- [x] Default pytest is zero-real-call; real integration is marker/env opt-in.
+- [x] A final explicit tiny real Hermes NEW run passed strict result validation,
+  Artifact collection, and Task verification. Real resume was not repeated after
+  earlier contract-negative calls; fake coverage proves the resume request shape.
+- [x] README and `docs/HERMES_BACKEND.md` document operation and the exact
+  idempotency limitation.
+- [x] No Codex, escalation, school compute, Hermes upgrade, or model reconfiguration
+  was added.
+
+### Phase 4 idempotency boundary
+
+Controller-process SIGKILL recovery is tested. Host-level exactly-once is not
+guaranteed across the gap after remote acceptance and before bridge response
+persistence. Phase 4 explicitly blocks rather than retrying that uncertain case.
+
+### Phase 4 verified result
+
+```text
+Default: 87 passed, 1 skipped (zero real model calls)
+Opt-in real: 1 passed
+```
+
+The successful real run persisted its Hermes run/session identity and exact
+reported usage (143,262 input tokens, 1,241 output tokens). The live gateway's
+large base/profile context dominates that input count; the SARS objective and
+deliverable were intentionally tiny.
+
+## Phase 5 Definition of Done
+
+- [x] Inspected Codex CLI 0.145.0, the absent Python SDK, fresh App Server
+  schemas, auth category, models, sandbox, approval, interruption, and usage
+  fields without changing login or global configuration.
+- [x] Selected one production driver: App Server stdio JSONL. `codex exec` is
+  not a backend and there is no parallel SDK path.
+- [x] Registered `CodexAdapter`; supported CODEX roles route to it while Hermes
+  routing and explicit Mock routing remain unchanged.
+- [x] Model discovery/default selection and configured model/effort validation
+  work without a hard-coded model name.
+- [x] Persisted `thread.id` as AgentRun.session_id and `turn.id` as
+  AgentRun.external_run_id. NEW, RESUME_ROLE, reviewer/role isolation, tier
+  isolation, and EPHEMERAL behavior pass Fake integration tests.
+- [x] Codex FORK_ROLE is explicitly deferred and rejected rather than silently
+  changing semantics.
+- [x] AgentResult and DecisionResult use one explicit, versioned Codex wire
+  layer and strict compatibility validator. Invalid output is rejected without
+  JSON repair.
+- [x] Artifact context is hash-verified, copied (not hardlinked), marked
+  read-only, and verified against DB-derived expectations after the turn. A
+  malicious manifest-plus-copy mutation is detected while the CAS stays intact.
+- [x] Codex cwd is the isolated AgentRun directory. Read-only/workspace-write,
+  default-off network, explicit network permission, and forbidden full access
+  are tested.
+- [x] Approval is never automatic. The generic CLI maps `once`/`deny` to native
+  `accept`/`decline` and survives Controller restart.
+- [x] Timeout and human cancellation send one interrupt and are distinguished
+  only after terminal `interrupted` observation.
+- [x] Turn-local `tokenUsage.last` prevents resumed-thread double counting; no
+  price table or dollar estimate is assumed.
+- [x] Request, raw final message, and normalized result are separate immutable
+  Artifacts. Bounded traces contain event metadata only, not chain-of-thought.
+- [x] Detached StartBridge records request/claim/thread/turn/approval/usage/
+  terminal state atomically. Lost turn responses reconcile through history and
+  the stable AgentRun marker without a second start.
+- [x] Unknown new-thread creation and missing known threads block safely; no
+  global exactly-once guarantee is claimed.
+- [x] A real Controller subprocess SIGKILL test proves bridge survival, same
+  AgentRun/Thread/Turn reconciliation, and exactly one fake `turn/start`.
+- [x] Transition and requested-task outputs remain proposals only. No automatic
+  escalation, school compute, scientific workflow, or Web UI was added.
+- [x] Codex Fake/unit tests pass; default pytest performs zero real Codex model
+  calls.
+- [x] One separately authorized Phase 5.1 turn passed strict schema preflight,
+  executed the model, and passed wire/domain/security validation after
+  same-thread result hydration.
+- [ ] The recovered real AgentRun succeeded, but the Task correctly blocked
+  because the no-local-command demo exposed only a file reference. The fixture
+  is now also inline, but no second Phase 5.1 turn was allowed to revalidate it.
+- [x] Full default suite passes: 131 passed, 2 opt-in integrations skipped.
+- [x] Hermes and local GPU/recovery specialized regressions pass independently.
+- [x] README, environment/plan notes, and `docs/CODEX_BACKEND.md` are updated.
+
+### Phase 5 recovery boundary
+
+Controller-process SIGKILL is tested and starts exactly one turn. A host crash
+in the new-thread response gap remains unknowable and blocks as
+`CODEX_START_STATE_UNCERTAIN`. A known thread can be searched by the stable
+AgentRun prompt marker. These are scoped recovery guarantees, not global
+exactly-once execution.
+
+### Phase 5 verified result
+
+```text
+Default: 131 passed, 2 skipped (zero real model calls)
+Codex schema/lifecycle focused: 44 passed
+Controller SIGKILL duplicate turn/start count: 1
+Phase 5 original real: 2 schema-preflight failures, 0 reported tokens
+Phase 5.1 real: preflight PASS; model executed; AgentRun SUCCEEDED; Task BLOCKED
+Phase 5.1 usage: 15,866 input, 0 cached input, 352 output
+```
+
+The structured-output blocker is resolved. Phase 6 escalation is not yet
+recommended because the required real Task end state was not `SUCCEEDED` and the
+adjusted inline fixture has not been re-called.
+
 ## Known risks / TODO
 
 1. Phase 1 uses metadata-based schema creation; introduce Alembic before schema
@@ -128,7 +264,7 @@ asserts Task/AgentRun success plus exactly one line in `launch_count.txt`.
    garbage-collect unreachable blobs after a conservative retention period.
 5. Local jobs are limited to exclusive zero/one-GPU execution. Multi-GPU, MIG,
    MPS, fractional allocation, memory packing, and preemption are deferred.
-6. Phase 3 uses MockAgent only. Hermes/Codex adapters, usage accounting,
-   escalation/retry policy, and scientific gates remain deferred.
-7. Agent FORK_ROLE, context summarization/excerpts, and automatic requested-task
+6. Hermes and Codex are optional; automatic escalation/retry policy and
+   scientific gates remain deferred.
+7. Codex FORK_ROLE, context summarization/excerpts, and automatic requested-task
    policy gates are deferred.

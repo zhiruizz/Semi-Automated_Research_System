@@ -1,0 +1,13 @@
+enabled: true
+app_server_command:
+  - codex
+  - app-server
+poll_interval_sec: 0.1
+request_timeout_sec: 30
+approval_poll_interval_sec: 0.1
+max_trace_events: 200
+network_default: false
+model_tiers:
+  supervisor:
+    model: null
+    effort: null

@@ -18,9 +18,10 @@ class SessionManager:
         role: str,
         backend: str,
         policy: SessionPolicy,
-    ) -> str:
+        model_tier: str,
+    ) -> str | None:
         if policy is SessionPolicy.RESUME_ROLE:
-            prior = session.scalar(
+            candidates = session.scalars(
                 select(AgentRun)
                 .where(
                     AgentRun.project_id == project_id,
@@ -31,8 +32,15 @@ class SessionManager:
                     AgentRun.mode != SessionPolicy.EPHEMERAL.value,
                 )
                 .order_by(AgentRun.finished_at.desc(), AgentRun.id.desc())
-            )
-            if prior is not None and prior.session_id:
-                return prior.session_id
+            ).all()
+            for prior in candidates:
+                if (
+                    prior.session_id
+                    and prior.config_json.get("model_tier") == model_tier
+                ):
+                    return prior.session_id
+        if backend != "mock":
+            # Hermes creates and returns the authoritative session identity.
+            return None
         prefix = "mock-ephemeral-session" if policy is SessionPolicy.EPHEMERAL else "mock-session"
         return new_id(prefix)

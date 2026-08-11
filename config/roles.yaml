@@ -14,6 +14,11 @@ roles:
     model_tier: supervisor
     session_policy: resume_role
     context_profile: scientific
+  experiment_planner:
+    logical_executor: codex
+    model_tier: supervisor
+    session_policy: resume_role
+    context_profile: scientific
   result_reviewer:
     logical_executor: codex
     model_tier: supervisor
@@ -29,3 +34,8 @@ roles:
     model_tier: supervisor
     session_policy: new
     context_profile: paper_review
+  integrity_reviewer:
+    logical_executor: codex
+    model_tier: supervisor
+    session_policy: new
+    context_profile: scientific_review
