@@ -1,0 +1,6 @@
+strategy: first_feasible
+phase_1:
+  allowed_providers:
+    - local
+  toy_preference:
+    - local_cpu

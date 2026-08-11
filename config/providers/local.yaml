@@ -1,0 +1,3 @@
+provider_id: local
+enabled: true
+root: workspace/.local-provider
