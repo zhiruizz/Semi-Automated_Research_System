@@ -8,12 +8,14 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from research_controller.db.models import Artifact, ComputeJob, Task
+from research_controller.db.models import AgentRun, Artifact, ComputeJob, Task
 from research_controller.domain.enums import (
+    AgentRunStatus,
     ArtifactIntegrityStatus,
     ComputeExecutionStatus,
 )
 from research_controller.protocols.compute import ComputeTaskSpec
+from research_controller.protocols.agent import AgentOutcome, AgentTaskSpec
 
 
 class ValidationResult:
@@ -96,5 +98,52 @@ class TaskValidator:
                 if artifact.logical_name in evidence_names or any(
                     artifact.logical_name.startswith(f"{name}:") for name in evidence_names
                 ):
+                    artifact.evidence_eligible = True
+        return ValidationResult(not reasons, reasons)
+
+    def validate_agent_task(self, session: Session, task: Task) -> ValidationResult:
+        spec = AgentTaskSpec.model_validate(task.spec_json)
+        run = session.scalar(
+            select(AgentRun)
+            .where(AgentRun.task_id == task.id)
+            .order_by(AgentRun.attempt_no.desc())
+        )
+        if run is None:
+            return ValidationResult(False, ["AgentRun missing"])
+        reasons: list[str] = []
+        if run.status is not AgentRunStatus.SUCCEEDED:
+            reasons.append(f"AgentRun status is {run.status.value}")
+        outcome = task.result_summary_json.get("agent_outcome")
+        if outcome != AgentOutcome.COMPLETED.value:
+            reasons.append(f"Agent outcome is {outcome!r}, expected 'completed'")
+        reasons.extend(task.result_summary_json.get("validation_reasons", []))
+        reasons.extend(task.result_summary_json.get("policy_violations", []))
+        if run.request_artifact_id is None:
+            reasons.append("Agent request Artifact missing")
+        if run.response_artifact_id is None:
+            reasons.append("Agent response Artifact missing")
+        artifacts = session.scalars(select(Artifact).where(Artifact.task_id == task.id)).all()
+        for deliverable in spec.deliverables:
+            matching = [
+                artifact
+                for artifact in artifacts
+                if artifact.logical_name == deliverable.logical_name
+                and artifact.kind == deliverable.artifact_kind
+            ]
+            if deliverable.required and not matching:
+                reasons.append(f"required deliverable missing: {deliverable.logical_name}")
+            elif matching and any(
+                artifact.integrity_status is not ArtifactIntegrityStatus.VERIFIED
+                for artifact in matching
+            ):
+                reasons.append(
+                    f"required deliverable is not verified: {deliverable.logical_name}"
+                )
+        if not reasons:
+            evidence_names = {
+                item.logical_name for item in spec.deliverables if item.evidence_candidate
+            }
+            for artifact in artifacts:
+                if artifact.logical_name in evidence_names:
                     artifact.evidence_eligible = True
         return ValidationResult(not reasons, reasons)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -13,6 +13,7 @@ from typing import Any
 from uuid import uuid4
 
 from research_controller.compute.base import ComputeProvider
+from research_controller.compute.local.nvidia_smi import NvidiaSmiClient
 from research_controller.domain.enums import (
     AccessMode,
     AccessStatus,
@@ -56,15 +57,30 @@ def _load_json(path: Path) -> dict[str, Any]:
     return value
 
 
+@dataclass(frozen=True)
+class LocalGpuPolicy:
+    avoid_external_busy: bool = True
+    external_memory_threshold_mb: int = 1_024
+    external_utilization_threshold_percent: int = 20
+
+
 class LocalProvider(ComputeProvider):
     provider_id = "local"
 
-    def __init__(self, root: Path | str) -> None:
+    def __init__(
+        self,
+        root: Path | str,
+        *,
+        nvidia_smi: NvidiaSmiClient | None = None,
+        gpu_policy: LocalGpuPolicy | None = None,
+    ) -> None:
         self.root = Path(root).resolve()
         self.jobs_root = self.root / "jobs"
         self.submissions_root = self.root / "submissions"
         self.jobs_root.mkdir(parents=True, exist_ok=True)
         self.submissions_root.mkdir(parents=True, exist_ok=True)
+        self.nvidia_smi = nvidia_smi or NvidiaSmiClient()
+        self.gpu_policy = gpu_policy or LocalGpuPolicy()
 
     def _submission_path(self, submission_key: str) -> Path:
         digest = hashlib.sha256(submission_key.encode("utf-8")).hexdigest()
@@ -89,36 +105,14 @@ class LocalProvider(ComputeProvider):
             metadata={"root": str(self.root)},
         )
 
-    async def _discover_gpus(self) -> list[dict[str, Any]]:
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "nvidia-smi",
-                "--query-gpu=index,name,memory.total",
-                "--format=csv,noheader,nounits",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-        except FileNotFoundError:
-            return []
-        stdout, _ = await process.communicate()
-        if process.returncode != 0:
-            return []
-        result: list[dict[str, Any]] = []
-        for line in stdout.decode("utf-8", errors="replace").splitlines():
-            pieces = [piece.strip() for piece in line.split(",", 2)]
-            if len(pieces) != 3:
-                continue
-            try:
-                result.append(
-                    {"index": int(pieces[0]), "name": pieces[1], "memory_mb": int(pieces[2])}
-                )
-            except ValueError:
-                continue
-        return result
-
     async def discover_resources(self) -> ResourceSnapshot:
         observed = _now()
-        gpus = await self._discover_gpus()
+        gpus = await self.nvidia_smi.inventory()
+        compute_processes = await self.nvidia_smi.compute_processes()
+        process_uuids = {process.gpu_uuid for process in compute_processes}
+        process_counts: dict[str, int] = {}
+        for process in compute_processes:
+            process_counts[process.gpu_uuid] = process_counts.get(process.gpu_uuid, 0) + 1
         offers = [
             ResourceOffer(
                 resource_class="local_cpu",
@@ -133,19 +127,48 @@ class LocalProvider(ComputeProvider):
             )
         ]
         for gpu in gpus:
+            external_busy = False
+            busy_reason: str | None = None
+            if gpu.uuid in process_uuids:
+                external_busy = True
+                busy_reason = "external_process"
+            elif gpu.memory_used_mb >= self.gpu_policy.external_memory_threshold_mb:
+                external_busy = True
+                busy_reason = "external_memory"
+            elif (
+                gpu.utilization_percent
+                >= self.gpu_policy.external_utilization_threshold_percent
+            ):
+                external_busy = True
+                busy_reason = "external_utilization"
+            schedulable = not (
+                external_busy and self.gpu_policy.avoid_external_busy
+            )
             offers.append(
                 ResourceOffer(
-                    resource_class=f"local_gpu_{gpu['index']}",
+                    resource_class=f"local_gpu_{gpu.index}",
                     resource_state=ResourceState.UP,
                     operational=True,
-                    schedulable=True,
-                    gpu_model=gpu["name"],
-                    gpu_memory_gb=round(gpu["memory_mb"] / 1024, 3),
+                    schedulable=schedulable,
+                    gpu_model=gpu.name,
+                    gpu_memory_gb=round(gpu.memory_total_mb / 1024, 3),
                     gpu_per_node=1,
-                    idle_nodes=1,
+                    idle_nodes=1 if schedulable else 0,
+                    allocated_nodes=0 if schedulable else 1,
                     capabilities=["cpu", "cuda", "local_process"],
                     access_mode=AccessMode.AUTOMATIC,
-                    metadata={"gpu_index": gpu["index"]},
+                    metadata={
+                        "gpu_index": gpu.index,
+                        "gpu_uuid": gpu.uuid,
+                        "gpu_model": gpu.name,
+                        "memory_total_mb": gpu.memory_total_mb,
+                        "memory_used_mb": gpu.memory_used_mb,
+                        "utilization_percent": gpu.utilization_percent,
+                        "controller_reserved": False,
+                        "external_busy": external_busy,
+                        "external_compute_process_count": process_counts.get(gpu.uuid, 0),
+                        "busy_reason": busy_reason,
+                    },
                 )
             )
         return ResourceSnapshot(
@@ -153,13 +176,18 @@ class LocalProvider(ComputeProvider):
             observed_at=observed,
             valid_until=observed + timedelta(seconds=15),
             offers=offers,
-            metadata={"gpu_count": len(gpus)},
+            metadata={
+                "gpu_count": len(gpus),
+                "external_compute_process_count": len(compute_processes),
+            },
         )
 
     async def can_run(self, spec: ComputeTaskSpec, snapshot: ResourceSnapshot) -> bool:
+        if spec.resources.gpu_count > 1:
+            return False
         required_caps = set(spec.resources.required_capabilities)
         for offer in snapshot.offers:
-            if not offer.operational or not offer.schedulable:
+            if not offer.operational:
                 continue
             if not required_caps.issubset(set(offer.capabilities)):
                 continue
@@ -176,15 +204,31 @@ class LocalProvider(ComputeProvider):
     async def prepare(self, spec: ComputeTaskSpec, resource_class: str) -> PreparedJob:
         if not spec.execution.command:
             raise ValueError(
-                "LocalProvider Phase 1 requires execution.command; artifact staging is deferred"
+                "LocalProvider requires execution.command; artifact staging is deferred"
             )
         key_hash = hashlib.sha256(spec.submission_key.encode("utf-8")).hexdigest()[:16]
         workdir = self.jobs_root / spec.project_id / spec.task_id / key_hash
         workdir.mkdir(parents=True, exist_ok=True)
         env = dict(spec.execution.env)
-        for offer in (await self.discover_resources()).offers:
-            if offer.resource_class == resource_class and "gpu_index" in offer.metadata:
-                env["CUDA_VISIBLE_DEVICES"] = str(offer.metadata["gpu_index"])
+        allocation: dict[str, Any]
+        if resource_class == "local_cpu":
+            if spec.resources.gpu_count != 0:
+                raise ValueError("GPU Task cannot be prepared on local_cpu")
+            allocation = {"allocation_type": "cpu"}
+        elif resource_class.startswith("local_gpu_"):
+            if spec.resources.gpu_count != 1:
+                raise ValueError("LocalProvider supports exactly one GPU per GPU job")
+            suffix = resource_class.removeprefix("local_gpu_")
+            if not suffix.isdigit():
+                raise ValueError(f"invalid local GPU resource class: {resource_class}")
+            gpu_index = int(suffix)
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+            allocation = {
+                "gpu_index": gpu_index,
+                "allocation_type": "exclusive",
+            }
+        else:
+            raise ValueError(f"unknown local resource class: {resource_class}")
         prepared = PreparedJob(
             provider_id=self.provider_id,
             submission_key=spec.submission_key,
@@ -193,7 +237,11 @@ class LocalProvider(ComputeProvider):
             command=[*spec.execution.command, *spec.execution.argv],
             env=env,
             outputs=spec.outputs,
-            metadata={"project_id": spec.project_id, "task_id": spec.task_id},
+            metadata={
+                "project_id": spec.project_id,
+                "task_id": spec.task_id,
+                "allocation": allocation,
+            },
         )
         _atomic_json(
             workdir / "prepared.json",

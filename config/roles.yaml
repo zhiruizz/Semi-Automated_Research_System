@@ -1,0 +1,31 @@
+roles:
+  implementation_worker:
+    logical_executor: hermes
+    model_tier: cheap
+    session_policy: resume_role
+    context_profile: implementation
+  debug_worker:
+    logical_executor: hermes
+    model_tier: cheap
+    session_policy: resume_role
+    context_profile: debug
+  scientific_supervisor:
+    logical_executor: codex
+    model_tier: supervisor
+    session_policy: resume_role
+    context_profile: scientific
+  result_reviewer:
+    logical_executor: codex
+    model_tier: supervisor
+    session_policy: new
+    context_profile: scientific_review
+  paper_writer:
+    logical_executor: codex
+    model_tier: supervisor
+    session_policy: resume_role
+    context_profile: writing
+  paper_reviewer:
+    logical_executor: codex
+    model_tier: supervisor
+    session_policy: new
+    context_profile: paper_review

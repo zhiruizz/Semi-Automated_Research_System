@@ -6,8 +6,9 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from research_controller.db.models import ComputeJob, Project, Task, TaskDependency
+from research_controller.db.models import AgentRun, ComputeJob, Project, Task, TaskDependency
 from research_controller.domain.enums import (
+    AgentRunStatus,
     ComputeExecutionStatus,
     ProjectLifecycle,
     ProjectPhase,
@@ -78,6 +79,7 @@ class ProjectStateService:
         spec: dict[str, Any],
         output_spec: dict[str, Any] | None = None,
         acceptance_policy: dict[str, Any] | None = None,
+        routing_policy: dict[str, Any] | None = None,
         dependency_ids: Iterable[str] = (),
         priority: int = 0,
         required: bool = True,
@@ -103,6 +105,7 @@ class ProjectStateService:
             spec_json=spec,
             output_spec_json=output_spec or {},
             acceptance_policy_json=acceptance_policy or {},
+            routing_policy_json=routing_policy or {},
             priority=priority,
             required=required,
             max_attempts=max_attempts,
@@ -139,6 +142,7 @@ class ProjectStateService:
         remote_workdir: str,
         spec: dict[str, Any],
         resource_snapshot: dict[str, Any],
+        provider_metadata: dict[str, Any] | None = None,
         correlation_id: str,
     ) -> ComputeJob:
         existing = session.scalar(
@@ -159,6 +163,7 @@ class ProjectStateService:
             remote_workdir=remote_workdir,
             spec_json=spec,
             resource_snapshot_json=resource_snapshot,
+            provider_metadata_json=provider_metadata or {},
         )
         session.add(job)
         session.flush()
@@ -174,3 +179,53 @@ class ProjectStateService:
             new_state=job.execution_status.value,
         )
         return job
+
+    def create_agent_run(
+        self,
+        session: Session,
+        *,
+        run_id: str | None = None,
+        task: Task,
+        backend: str,
+        role: str,
+        session_id: str,
+        mode: str,
+        config: dict[str, Any],
+        correlation_id: str,
+    ) -> AgentRun:
+        attempt_no = task.attempt_count + 1
+        existing = session.scalar(
+            select(AgentRun).where(
+                AgentRun.task_id == task.id,
+                AgentRun.attempt_no == attempt_no,
+            )
+        )
+        if existing is not None:
+            return existing
+        run = AgentRun(
+            id=run_id or new_id("arun"),
+            project_id=task.project_id,
+            task_id=task.id,
+            backend=backend,
+            role=role,
+            session_id=session_id,
+            mode=mode,
+            attempt_no=attempt_no,
+            status=AgentRunStatus.QUEUED,
+            config_json=config,
+        )
+        session.add(run)
+        session.flush()
+        self.events.append(
+            session,
+            project_id=task.project_id,
+            event_type="AGENT_RUN_CREATED",
+            entity_type="AGENT_RUN",
+            entity_id=run.id,
+            correlation_id=correlation_id,
+            dedupe_key=f"agent-run-created:{task.id}:{attempt_no}",
+            old_state=None,
+            new_state=run.status.value,
+            payload={"backend": backend, "role": role},
+        )
+        return run

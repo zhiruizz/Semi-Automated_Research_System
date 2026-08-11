@@ -9,7 +9,7 @@ import sys
 from sqlalchemy import select
 
 from research_controller.controller import ResearchController
-from research_controller.db.models import Artifact, ComputeJob, Event, Project, Task
+from research_controller.db.models import AgentRun, Artifact, ComputeJob, Event, Project, Task
 from research_controller.db.session import (
     create_session_factory,
     create_sqlite_engine,
@@ -18,6 +18,7 @@ from research_controller.db.session import (
 from research_controller.domain.enums import ProjectStage, TaskExecutor, TaskKind
 from research_controller.domain.ids import new_id
 from research_controller.protocols.compute import ComputeTaskSpec
+from research_controller.protocols.agent import AgentTaskSpec
 from research_controller.observability import configure_structured_logging
 from research_controller.services.project_state import ProjectStateService
 
@@ -93,11 +94,65 @@ def create_demo(factory, workspace: Path) -> tuple[str, str]:
         return project.id, task.id
 
 
+def create_agent_demo(factory, workspace: Path) -> tuple[str, str]:
+    service = ProjectStateService()
+    with factory.begin() as session:
+        project = session.scalar(select(Project).where(Project.slug == "demo-agent"))
+        if project is None:
+            project = service.create_project(
+                session,
+                slug="demo-agent",
+                title="Typed MockAgent vertical slice",
+                workspace_uri=str(workspace.resolve()),
+            )
+        existing = session.scalar(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.idempotency_key == "demo-agent:v1",
+            )
+        )
+        if existing is not None:
+            return project.id, existing.id
+        task_id = new_id("tsk")
+        spec = AgentTaskSpec.model_validate(
+            {
+                "schema_version": "agent-task/v0.1",
+                "project_id": project.id,
+                "task_id": task_id,
+                "role": "implementation_worker",
+                "objective": "produce a typed implementation summary",
+                "instructions": ["return only the declared deliverable"],
+                "deliverables": [
+                    {
+                        "logical_name": "implementation_summary",
+                        "artifact_kind": "RESULT_SUMMARY",
+                        "required": True,
+                    }
+                ],
+                "execution_policy": {"session_policy": "new", "timeout_sec": 30},
+            }
+        )
+        task = service.create_task(
+            session,
+            task_id=task_id,
+            project_id=project.id,
+            stage=ProjectStage.TOY_IMPLEMENT,
+            kind=TaskKind.AGENT,
+            action="run_mock_agent_demo",
+            executor=TaskExecutor.HERMES,
+            idempotency_key="demo-agent:v1",
+            spec=spec.model_dump(mode="json"),
+            routing_policy={"mock": {"delay_sec": 0.1}},
+        )
+        return project.id, task.id
+
+
 def print_status(factory) -> None:
     with factory() as session:
         projects = session.scalars(select(Project)).all()
         tasks = session.scalars(select(Task)).all()
         jobs = session.scalars(select(ComputeJob)).all()
+        agent_runs = session.scalars(select(AgentRun)).all()
         artifacts = session.scalars(select(Artifact)).all()
         events = session.scalars(select(Event).order_by(Event.project_id, Event.seq)).all()
         value = {
@@ -117,6 +172,16 @@ def print_status(factory) -> None:
                     "exit_code": item.exit_code,
                 }
                 for item in jobs
+            ],
+            "agent_runs": [
+                {
+                    "id": item.id,
+                    "backend": item.backend,
+                    "role": item.role,
+                    "status": item.status.value,
+                    "session_id": item.session_id,
+                }
+                for item in agent_runs
             ],
             "artifacts": [
                 {
@@ -149,6 +214,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("init-db")
     demo = subparsers.add_parser("demo")
     demo.add_argument("--run", action="store_true")
+    agent_demo = subparsers.add_parser("agent-demo")
+    agent_demo.add_argument("--run", action="store_true")
     run = subparsers.add_parser("run")
     run.add_argument("--once", action="store_true")
     run.add_argument("--interval", type=float, default=1.0)
@@ -167,6 +234,12 @@ def main() -> None:
             print(f"initialized {args.database.resolve()}")
         elif args.command == "demo":
             project_id, task_id = create_demo(factory, args.workspace)
+            print(f"created project={project_id} task={task_id}")
+            if args.run:
+                asyncio.run(controller.run_until_idle())
+                print_status(factory)
+        elif args.command == "agent-demo":
+            project_id, task_id = create_agent_demo(factory, args.workspace)
             print(f"created project={project_id} task={task_id}")
             if args.run:
                 asyncio.run(controller.run_until_idle())

@@ -1,3 +1,7 @@
 provider_id: local
 enabled: true
 root: workspace/.local-provider
+local_gpu:
+  avoid_external_busy: true
+  external_memory_threshold_mb: 1024
+  external_utilization_threshold_percent: 20

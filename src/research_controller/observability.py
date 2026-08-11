@@ -13,6 +13,8 @@ CONTEXT_FIELDS = (
     "compute_job_id",
     "correlation_id",
     "event_type",
+    "reason",
+    "resource_class",
 )
 
 
